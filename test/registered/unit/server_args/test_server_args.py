@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -34,6 +35,25 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_mimo_v2_hicache_keeps_hybrid_swa_memory(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.model_path = "/tmp/scratch-space/MiMo-V2.5"
+        server_args.enable_hierarchical_cache = True
+        server_args.speculative_algorithm = "EAGLE"
+        server_args.swa_full_tokens_ratio = 0.25
+        server_args.disable_hybrid_swa_memory = False
+
+        fake_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
+        )
+        server_args.get_model_config = MagicMock(return_value=fake_model_config)
+
+        server_args._handle_model_specific_adjustments()
+
+        self.assertTrue(server_args.enable_multi_layer_eagle)
+        self.assertEqual(server_args.swa_full_tokens_ratio, 1.0)
+        self.assertFalse(server_args.disable_hybrid_swa_memory)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

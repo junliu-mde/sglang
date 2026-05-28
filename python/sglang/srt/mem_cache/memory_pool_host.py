@@ -379,8 +379,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize
+        self.can_use_jit = (
+            self.same_kv_dim
+            and _is_cuda
+            and can_use_hicache_jit_kernel(
+                element_size=self.element_dim * self.dtype.itemsize
+            )
         )
 
         if self.layout == "page_first":
@@ -407,50 +411,132 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
+        self.v_head_dim = self.device_pool.v_head_dim
         self.layer_num = self.device_pool.layer_num
+        self.same_kv_dim = self.head_dim == self.v_head_dim
 
-        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+        return (
+            (self.head_dim + self.v_head_dim)
+            * self.head_num
+            * self.layer_num
+            * self.dtype.itemsize
+        )
 
     def get_ksize_per_token(self):
-        return self.get_size_per_token() // 2
+        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
 
     def init_kv_buffer(self):
+        self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+        self.v_token_stride_size = self.head_num * self.v_head_dim * self.dtype.itemsize
+        self.v_layout_dim = self.v_token_stride_size * self.layer_num
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         if self.layout == "layer_first":
-            dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+            if self.same_kv_dim:
+                dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+                return alloc_func(
+                    dims,
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+            k_dims = (self.layer_num, self.size, self.head_num, self.head_dim)
+            v_dims = (self.layer_num, self.size, self.head_num, self.v_head_dim)
         elif self.layout == "page_first":
-            dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+            if self.same_kv_dim:
+                dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+                return alloc_func(
+                    dims,
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+            k_dims = (self.size, self.layer_num, self.head_num, self.head_dim)
+            v_dims = (self.size, self.layer_num, self.head_num, self.v_head_dim)
         elif self.layout == "page_first_direct":
-            dims = (
-                2,
+            if self.same_kv_dim:
+                dims = (
+                    2,
+                    self.page_num,
+                    self.layer_num,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                )
+                return alloc_func(
+                    dims,
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+            k_dims = (
                 self.page_num,
                 self.layer_num,
                 self.page_size,
                 self.head_num,
                 self.head_dim,
             )
+            v_dims = (
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.v_head_dim,
+            )
         elif self.layout == "page_head":
-            dims = (
-                2,
+            if self.same_kv_dim:
+                dims = (
+                    2,
+                    self.page_num,
+                    self.head_num,
+                    self.page_size,
+                    self.layer_num,
+                    self.head_dim,
+                )
+                return alloc_func(
+                    dims,
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+            k_dims = (
                 self.page_num,
                 self.head_num,
                 self.page_size,
                 self.layer_num,
                 self.head_dim,
+            )
+            v_dims = (
+                self.page_num,
+                self.head_num,
+                self.page_size,
+                self.layer_num,
+                self.v_head_dim,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
-        self.layout_dim = self.token_stride_size * self.layer_num
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        buffer = alloc_func(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            allocator=self.allocator,
-        )
-        return buffer
+        return [
+            alloc_func(
+                k_dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            ),
+            alloc_func(
+                v_dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            ),
+        ]
 
     @property
     def k_buffer(self):
@@ -469,6 +555,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         io_backend,
     ):
         if io_backend == "kernel":
+            if not self.same_kv_dim:
+                raise NotImplementedError(
+                    "HiCache kernel IO backend does not support asymmetric K/V head dims. "
+                    "Please use hicache_io_backend=direct."
+                )
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer(
@@ -581,6 +672,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if io_backend == "kernel":
+            if not self.same_kv_dim:
+                raise NotImplementedError(
+                    "HiCache kernel IO backend does not support asymmetric K/V head dims. "
+                    "Please use hicache_io_backend=direct."
+                )
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer(
@@ -685,57 +781,172 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        if self.same_kv_dim:
+            if self.layout == "layer_first":
+                data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
+            elif self.layout == "page_first":
+                data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
+            elif self.layout in ["page_first_direct", "page_head"]:
+                real_index = index // self.page_size
+                data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            if flat:
+                data_page = data_page.flatten()
+            return data_page
+
         if self.layout == "layer_first":
-            data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
+            k_page = self.k_buffer[:, index : index + self.page_size, :, :]
+            v_page = self.v_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
-            data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
+            k_page = self.k_buffer[index : index + self.page_size, :, :, :]
+            v_page = self.v_buffer[index : index + self.page_size, :, :, :]
         elif self.layout in ["page_first_direct", "page_head"]:
             real_index = index // self.page_size
-            data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
+            k_page = self.k_buffer[real_index : real_index + 1, :, :, :, :]
+            v_page = self.v_buffer[real_index : real_index + 1, :, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        if flat:
-            data_page = data_page.flatten()
-        return data_page
+
+        if not flat:
+            return torch.cat([k_page.flatten(), v_page.flatten()])
+        return torch.cat([k_page.flatten(), v_page.flatten()])
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        return torch.zeros(
-            (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
-            dtype=self.dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        ).flatten()
+        if self.same_kv_dim:
+            return torch.zeros(
+                (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            ).flatten()
+        return torch.cat(
+            [
+                torch.zeros(
+                    (self.layer_num, self.page_size, self.head_num, self.head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                ).flatten(),
+                torch.zeros(
+                    (self.layer_num, self.page_size, self.head_num, self.v_head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                ).flatten(),
+            ]
+        )
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        if self.layout == "layer_first":
-            self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
-                data_page.reshape(
-                    2,
-                    self.layer_num,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
+        if self.same_kv_dim:
+            if self.layout == "layer_first":
+                self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
+                    data_page.reshape(
+                        2,
+                        self.layer_num,
+                        self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                    )
                 )
+            elif self.layout == "page_first":
+                self.kv_buffer[:, index : index + self.page_size, :, :, :] = (
+                    data_page.reshape(
+                        2,
+                        self.page_size,
+                        self.layer_num,
+                        self.head_num,
+                        self.head_dim,
+                    )
+                )
+            elif self.layout == "page_first_direct":
+                real_index = index // self.page_size
+                self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
+                    data_page.reshape(
+                        2,
+                        1,
+                        self.layer_num,
+                        self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                    )
+                )
+            elif self.layout == "page_head":
+                real_index = index // self.page_size
+                self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
+                    data_page.reshape(
+                        2,
+                        1,
+                        self.head_num,
+                        self.page_size,
+                        self.layer_num,
+                        self.head_dim,
+                    )
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            return
+
+        k_numel = self.layer_num * self.page_size * self.head_num * self.head_dim
+        k_data = data_page[:k_numel]
+        v_data = data_page[k_numel:]
+        if self.layout == "layer_first":
+            self.k_buffer[:, index : index + self.page_size, :, :] = k_data.reshape(
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+            self.v_buffer[:, index : index + self.page_size, :, :] = v_data.reshape(
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.v_head_dim,
             )
         elif self.layout == "page_first":
-            self.kv_buffer[:, index : index + self.page_size, :, :, :] = (
-                data_page.reshape(
-                    2, self.page_size, self.layer_num, self.head_num, self.head_dim
-                )
+            self.k_buffer[index : index + self.page_size, :, :, :] = k_data.reshape(
+                self.page_size,
+                self.layer_num,
+                self.head_num,
+                self.head_dim,
+            )
+            self.v_buffer[index : index + self.page_size, :, :, :] = v_data.reshape(
+                self.page_size,
+                self.layer_num,
+                self.head_num,
+                self.v_head_dim,
             )
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
-            self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
-                data_page.reshape(
-                    2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
-                )
+            self.k_buffer[real_index : real_index + 1, :, :, :, :] = k_data.reshape(
+                1,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+            self.v_buffer[real_index : real_index + 1, :, :, :, :] = v_data.reshape(
+                1,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.v_head_dim,
             )
         elif self.layout == "page_head":
             real_index = index // self.page_size
-            self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
-                data_page.reshape(
-                    2, 1, self.head_num, self.page_size, self.layer_num, self.head_dim
-                )
+            self.k_buffer[real_index : real_index + 1, :, :, :, :] = k_data.reshape(
+                1,
+                self.head_num,
+                self.page_size,
+                self.layer_num,
+                self.head_dim,
+            )
+            self.v_buffer[real_index : real_index + 1, :, :, :, :] = v_data.reshape(
+                1,
+                self.head_num,
+                self.page_size,
+                self.layer_num,
+                self.v_head_dim,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -749,6 +960,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         assert self.layout == "page_head"
         assert len(indices) % self.page_size == 0
         assert self.head_num % split_factor == 0
+        if not self.same_kv_dim:
+            raise NotImplementedError(
+                "Split-head zero-copy metadata is not implemented for asymmetric K/V head dims."
+            )
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -793,6 +1008,76 @@ class MHATokenToKVPoolHost(HostKVCache):
         meta data for zero copy
         """
         assert len(indices) % self.page_size == 0
+        if not self.same_kv_dim:
+            ptr_list = []
+            element_size_list = []
+            indices = indices.tolist()
+            k_buffer_data_ptr = self.k_buffer.data_ptr()
+            v_buffer_data_ptr = self.v_buffer.data_ptr()
+            k_element_size = (
+                self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+            )
+            v_element_size = (
+                self.dtype.itemsize * self.page_size * self.head_num * self.v_head_dim
+            )
+            if self.layout == "layer_first":
+                for index in range(0, len(indices), self.page_size):
+                    for layer_id in range(self.layer_num):
+                        k_ptr = (
+                            k_buffer_data_ptr
+                            + indices[index]
+                            * self.head_num
+                            * self.head_dim
+                            * self.dtype.itemsize
+                            + layer_id
+                            * self.size
+                            * self.head_num
+                            * self.head_dim
+                            * self.dtype.itemsize
+                        )
+                        v_ptr = (
+                            v_buffer_data_ptr
+                            + indices[index]
+                            * self.head_num
+                            * self.v_head_dim
+                            * self.dtype.itemsize
+                            + layer_id
+                            * self.size
+                            * self.head_num
+                            * self.v_head_dim
+                            * self.dtype.itemsize
+                        )
+                        ptr_list.extend([k_ptr, v_ptr])
+                        element_size_list.extend([k_element_size, v_element_size])
+            elif self.layout in ["page_first", "page_first_direct", "page_head"]:
+                for index in range(0, len(indices), self.page_size):
+                    k_ptr = (
+                        k_buffer_data_ptr
+                        + indices[index]
+                        * self.layer_num
+                        * self.head_num
+                        * self.head_dim
+                        * self.dtype.itemsize
+                    )
+                    v_ptr = (
+                        v_buffer_data_ptr
+                        + indices[index]
+                        * self.layer_num
+                        * self.head_num
+                        * self.v_head_dim
+                        * self.dtype.itemsize
+                    )
+                    ptr_list.extend([k_ptr, v_ptr])
+                    element_size_list.extend(
+                        [
+                            k_element_size * self.layer_num,
+                            v_element_size * self.layer_num,
+                        ]
+                    )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            return ptr_list, element_size_list
+
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -849,6 +1134,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+    def get_hybrid_pool_buffer(self):
+        if self.same_kv_dim:
+            return [self.kv_buffer]
+        return [self.k_buffer, self.v_buffer]
 
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):

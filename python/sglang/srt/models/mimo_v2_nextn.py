@@ -19,7 +19,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.configs.model_config import (
+    get_first_swa_layer_id_from_hybrid_pattern,
+    get_mimo_v2_fused_qkv_expected_tp_size,
+)
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
@@ -119,7 +122,9 @@ class MiMoV2MTPLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
         self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
+            # The MTP block is a single local layer for communicator semantics.
+            # Keep the attention layer_id for KV pool routing only.
+            layer_id=0,
             num_layers=1,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
@@ -184,10 +189,11 @@ class MiMoV2ModelNextN(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        mtp_attn_layer_id = get_first_swa_layer_id_from_hybrid_pattern(config)
 
         self.mtp_block = MiMoV2MTPLayer(
             config,
-            0,
+            mtp_attn_layer_id,
             quant_config=quant_config,
             prefix=add_prefix("decoder", prefix),
         )

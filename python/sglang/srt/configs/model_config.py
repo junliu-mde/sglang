@@ -1686,6 +1686,20 @@ def is_hybrid_swa_model(model_architectures: List[str]):
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
 
+def get_first_swa_layer_id_from_hybrid_pattern(
+    hf_text_config: PretrainedConfig,
+) -> int:
+    hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
+    if hybrid_layer_pattern is None:
+        return 0
+
+    first_swa_layer_id = next(
+        (i for i, layer_type in enumerate(hybrid_layer_pattern) if layer_type == 1),
+        None,
+    )
+    return 0 if first_swa_layer_id is None else first_swa_layer_id
+
+
 def get_hybrid_layer_ids(
     model_architectures: List[str],
     hf_text_config: PretrainedConfig,
@@ -1715,7 +1729,9 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
-        swa_attention_layer_ids = [0]
+        swa_attention_layer_ids = [
+            get_first_swa_layer_id_from_hybrid_pattern(hf_text_config)
+        ]
         full_attention_layer_ids = []
     elif (
         "Step3p5ForCausalLM" in model_architectures

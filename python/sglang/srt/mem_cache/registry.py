@@ -94,7 +94,9 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or (
+        ctx.enable_hierarchical_cache and (ctx.is_hybrid_swa or ctx.is_hybrid_ssm)
+    ):
         from sglang.srt.mem_cache.unified_cache_components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
