@@ -412,7 +412,20 @@ class TestHiCacheArgs(unittest.TestCase):
         if expected_decode_backend is not None:
             self.assertEqual(args.decode_attention_backend, expected_decode_backend)
 
-    def test_hicache_io_backend_and_mem_layout_compatibility(self):
+    @patch.object(
+        ServerArgs,
+        "get_model_config",
+        return_value=SimpleNamespace(
+            attention_arch="MHA",
+            head_dim=128,
+            v_head_dim=128,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
+        ),
+    )
+    def test_hicache_io_backend_and_mem_layout_compatibility(
+        self, _mock_get_model_config
+    ):
         cases = [
             {
                 "name": "kernel_with_page_first_direct",

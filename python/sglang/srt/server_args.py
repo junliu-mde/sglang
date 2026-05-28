@@ -3615,8 +3615,9 @@ class ServerArgs:
         Resolution order:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
-        3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
-        4) Re-run step (1) if step (3) changed I/O backend.
+        3) I/O <-> model-shape performance compatibility (may rewrite I/O backend).
+        4) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
+        5) Re-run step (1) if step (3) or step (4) changed I/O backend.
         """
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
@@ -3631,10 +3632,13 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
-        # Step 3: IO-decode backend compatibility (may change io backend).
-        io_changed = self._resolve_io_decode_attention_compatibility()
+        # Step 3: Prefer the faster direct backend for asymmetric MHA K/V layouts.
+        io_changed = self._resolve_io_asymmetric_kv_performance_compatibility()
 
-        # Step 4: Re-normalize layout after io backend changes.
+        # Step 4: IO-decode backend compatibility (may change io backend).
+        io_changed = self._resolve_io_decode_attention_compatibility() or io_changed
+
+        # Step 5: Re-normalize layout after io backend changes.
         if io_changed:
             self._resolve_layout_io_compatibility()
 
@@ -3677,6 +3681,29 @@ class ServerArgs:
             f"Mooncake storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
+
+    def _resolve_io_asymmetric_kv_performance_compatibility(self) -> bool:
+        if self.hicache_io_backend != "kernel":
+            return False
+
+        model_config = self.get_model_config()
+        attention_arch = getattr(model_config, "attention_arch", None)
+        if getattr(attention_arch, "name", attention_arch) != "MHA":
+            return False
+
+        full_head_dim = getattr(model_config, "head_dim", None)
+        full_v_head_dim = getattr(model_config, "v_head_dim", full_head_dim)
+        swa_head_dim = getattr(model_config, "swa_head_dim", full_head_dim)
+        swa_v_head_dim = getattr(model_config, "swa_v_head_dim", swa_head_dim)
+        if full_head_dim == full_v_head_dim and swa_head_dim == swa_v_head_dim:
+            return False
+
+        self.hicache_io_backend = "direct"
+        logger.warning(
+            "Asymmetric K/V head dims currently perform better with direct HiCache I/O than kernel I/O. "
+            "Switching hicache_io_backend to direct."
+        )
+        return True
 
     def _resolve_io_decode_attention_compatibility(self) -> bool:
         if self.hicache_io_backend != "kernel":
