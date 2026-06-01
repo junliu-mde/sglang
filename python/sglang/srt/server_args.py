@@ -3615,7 +3615,7 @@ class ServerArgs:
         Resolution order:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
-        3) I/O <-> model-shape performance compatibility (may rewrite I/O backend).
+        3) I/O <-> model-shape compatibility (may rewrite I/O backend).
         4) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
         5) Re-run step (1) if step (3) or step (4) changed I/O backend.
         """
@@ -3632,8 +3632,8 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
-        # Step 3: Prefer the faster direct backend for asymmetric MHA K/V layouts.
-        io_changed = self._resolve_io_asymmetric_kv_performance_compatibility()
+        # Step 3: IO-model layout compatibility (may change io backend).
+        io_changed = self._resolve_io_asymmetric_kv_compatibility()
 
         # Step 4: IO-decode backend compatibility (may change io backend).
         io_changed = self._resolve_io_decode_attention_compatibility() or io_changed
@@ -3682,7 +3682,7 @@ class ServerArgs:
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
 
-    def _resolve_io_asymmetric_kv_performance_compatibility(self) -> bool:
+    def _resolve_io_asymmetric_kv_compatibility(self) -> bool:
         if self.hicache_io_backend != "kernel":
             return False
 
@@ -3700,7 +3700,7 @@ class ServerArgs:
 
         self.hicache_io_backend = "direct"
         logger.warning(
-            "Asymmetric K/V head dims currently perform better with direct HiCache I/O than kernel I/O. "
+            "HiCache kernel I/O does not support asymmetric K/V head dims. "
             "Switching hicache_io_backend to direct."
         )
         return True

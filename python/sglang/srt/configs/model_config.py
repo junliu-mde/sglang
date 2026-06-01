@@ -1691,13 +1691,17 @@ def get_first_swa_layer_id_from_hybrid_pattern(
 ) -> int:
     hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
     if hybrid_layer_pattern is None:
-        return 0
+        raise ValueError(
+            "MiMoV2MTP requires hybrid_layer_pattern to select a SWA layer"
+        )
 
     first_swa_layer_id = next(
         (i for i, layer_type in enumerate(hybrid_layer_pattern) if layer_type == 1),
         None,
     )
-    return 0 if first_swa_layer_id is None else first_swa_layer_id
+    if first_swa_layer_id is None:
+        raise ValueError("MiMoV2MTP requires at least one SWA layer")
+    return first_swa_layer_id
 
 
 def get_hybrid_layer_ids(

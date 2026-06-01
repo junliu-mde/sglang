@@ -1,16 +1,15 @@
-import unittest
-
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=8, stage="stage-b", runner_config="1-gpu-small")
 
 
-class TestMHAHiCacheAsymmetricKV(unittest.TestCase):
+class TestMHAHiCacheAsymmetricKV(CustomTestCase):
     def setUp(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for MHA host transfer tests.")
@@ -80,6 +79,12 @@ class TestMHAHiCacheAsymmetricKV(unittest.TestCase):
             self.assertTrue(torch.equal(got_k, expected_k))
             self.assertTrue(torch.equal(got_v, expected_v))
 
+        k_page, v_page = host_pool.get_data_page(0, flat=False)
+        self.assertEqual(k_page.shape, (layer_num, page_size, 2, 192))
+        self.assertEqual(v_page.shape, (layer_num, page_size, 2, 128))
+
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

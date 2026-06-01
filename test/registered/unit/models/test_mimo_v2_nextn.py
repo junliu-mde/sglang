@@ -23,10 +23,12 @@ class TestMiMoV2NextN(CustomTestCase):
     def test_get_first_swa_layer_id_from_hybrid_pattern(self):
         cfg = SimpleNamespace(hybrid_layer_pattern=[0, 0, 1, 1])
         self.assertEqual(get_first_swa_layer_id_from_hybrid_pattern(cfg), 2)
-        self.assertEqual(
-            get_first_swa_layer_id_from_hybrid_pattern(SimpleNamespace()),
-            0,
-        )
+        with self.assertRaisesRegex(ValueError, "hybrid_layer_pattern"):
+            get_first_swa_layer_id_from_hybrid_pattern(SimpleNamespace())
+        with self.assertRaisesRegex(ValueError, "at least one SWA layer"):
+            get_first_swa_layer_id_from_hybrid_pattern(
+                SimpleNamespace(hybrid_layer_pattern=[0, 0])
+            )
 
     def test_mimo_v2_mtp_hybrid_ids_use_first_swa_layer(self):
         cfg = SimpleNamespace(

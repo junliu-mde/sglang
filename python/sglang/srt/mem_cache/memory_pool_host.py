@@ -809,7 +809,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
         if not flat:
-            return torch.cat([k_page.flatten(), v_page.flatten()])
+            return [k_page, v_page]
         return torch.cat([k_page.flatten(), v_page.flatten()])
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
